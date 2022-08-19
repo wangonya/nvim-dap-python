@@ -3,6 +3,10 @@
 local api = vim.api
 local M = {}
 
+local root_session
+local sessions = {}
+
+
 --- Test runner to use by default. Default is "unittest". See |dap-python.test_runners|
 --- Override this to set a different runner:
 --- ```
@@ -21,6 +25,54 @@ M.test_runners = {}
 local function prune_nil(items)
   return vim.tbl_filter(function(x) return x end, items)
 end
+
+M.widgets = {}
+M.widgets.sessions = {
+  refresh_listener = {'event_initialized', 'event_stopped', 'event_terminated'},
+  new_buf = function()
+    local buf = api.nvim_create_buf(false, true)
+    api.nvim_buf_set_option(buf, 'buftype', 'nofile')
+    api.nvim_buf_set_keymap(
+      buf, "n", "<CR>", "<Cmd>lua require('dap.ui').trigger_actions()<CR>", {})
+    api.nvim_buf_set_keymap(
+      buf, "n", "<2-LeftMouse>", "<Cmd>lua require('dap.ui').trigger_actions()<CR>", {})
+    return buf
+  end,
+  render = function(view)
+    local layer = view.layer()
+    local render_session = function(session)
+      local dap = require('dap')
+      local suffix
+      if session.current_frame then
+        suffix = 'Stopped at line ' .. session.current_frame.line
+      elseif session.stopped_thread_id then
+        suffix = 'Stopped'
+      else
+        suffix = 'Running'
+      end
+      local config_name = (session.config or {}).name or 'No name'
+      local prefix = session == dap.session() and '→ ' or '  '
+      return prefix .. config_name .. ' (' .. suffix .. ')'
+    end
+    local context = {}
+    context.actions = {
+      {
+        label = 'Activate session',
+        fn = function(_, session)
+          if session then
+            require('dap').set_session(session)
+            if vim.bo.bufhidden == 'wipe' then
+              view.close()
+            else
+              view.refresh()
+            end
+          end
+        end
+      }
+    }
+    layer.render(vim.tbl_keys(sessions), render_session, context)
+  end
+}
 
 local is_windows = function()
     return vim.loop.os_uname().sysname:find("Windows", 1, true) and true
@@ -124,6 +176,41 @@ function M.setup(adapter_python_path, opts)
       })
     end
   end
+
+  dap.listeners.after['event_debugpyAttach']['dap-python'] = function(_, config)
+    local adapter = {
+      host = config.connect.host,
+      port = config.connect.port,
+    }
+    local session
+    local connect_opts = {}
+    session = require('dap.session'):connect(adapter, connect_opts, function(err)
+      if err then
+        vim.notify('Error connecting to subprocess session: ' .. vim.inspect(err), vim.log.levels.WARN)
+      elseif session then
+        session:initialize(config)
+        dap.set_session(session)
+      end
+    end)
+  end
+
+  dap.listeners.after.event_initialized['dap-python'] = function(session)
+    sessions[session] = true
+    if not root_session then
+      root_session = session
+    end
+  end
+  local remove_session = function(session)
+    sessions[session] = nil
+    if session == root_session then
+      root_session = nil
+    elseif dap.session() == session or dap.session() == nil then
+      dap.set_session(root_session)
+    end
+  end
+  dap.listeners.after.event_exited['dap-python'] = remove_session
+  dap.listeners.after.event_terminated['dap-python'] = remove_session
+  dap.listeners.after.disconnected['dap-python'] = remove_session
 
   if opts.include_configs then
     dap.configurations.python = dap.configurations.python or {}
